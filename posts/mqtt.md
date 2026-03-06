@@ -152,6 +152,18 @@ Once subscribed, the desktop agent can receive messages from the backend.
 
 ---
 
+## Implementation Details
+
+The desktop application is implemented in **C#.NET** and runs primarily inside a **Windows Service**.  
+The service establishes and maintains a persistent MQTT connection with the broker using a .NET MQTT client library.
+
+On the backend side, publishers are implemented in **Java** using the **HiveMQ MQTT client library**. Backend services publish messages directly to deterministic device topics without maintaining any state about connected devices.
+
+Because routing and delivery guarantees are handled by the MQTT broker, backend services remain stateless and horizontally scalable.
+
+---
+
+
 # Stateless Publisher Design
 
 Backend services publish messages directly to the topic:

@@ -14,8 +14,7 @@
     <title>Using MQTT for Device Communication | Ajit Katte</title>
     <link rel="stylesheet" href="../assets/style.css">
     <link rel="icon" href="../assets/favicon.ico">
-    <link rel="stylesheet"
-href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
 </head>
 
 <body>
@@ -26,9 +25,9 @@ href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.m
 
         <h1>Using MQTT for device communication</h1>
         <p class="post-meta">
-<span id="reading-time"></span> ·
-<span id="last-updated"></span>
-</p>
+            <span id="reading-time"></span> ·
+            <span id="last-updated"></span>
+        </p>
 
     </header>
 
@@ -183,6 +182,17 @@ href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.m
             <li>The client subscribes to its device topic.</li>
         </ol>
         <p>Once subscribed, the desktop application can receive messages from the backend.</p>
+        <hr>
+        <h2 id="implementation-details">Implementation Details</h2>
+        <p>The desktop application is implemented in <strong>C#.NET</strong> and runs primarily inside a <strong>Windows
+                Service</strong>.<br>
+            The service establishes and maintains a persistent MQTT connection with the broker using a .NET MQTT client
+            library.</p>
+        <p>On the backend side, publishers are implemented in <strong>Java</strong> using the <strong>HiveMQ MQTT client
+                library</strong>. Backend services publish messages directly to deterministic device topics without
+            maintaining any state about connected devices.</p>
+        <p>Because routing and delivery guarantees are handled by the MQTT broker, backend services remain stateless and
+            horizontally scalable.</p>
         <hr>
         <h1 id="stateless-publisher-design">Stateless Publisher Design</h1>
         <p>Backend services publish messages directly to the topic:</p>
