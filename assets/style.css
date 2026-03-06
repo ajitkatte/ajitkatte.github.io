@@ -91,3 +91,21 @@ hr {
     }
 
 }
+
+#toc {
+  list-style: none;
+  padding-left: 0;
+}
+
+#toc li {
+  margin: 6px 0;
+}
+
+#toc a {
+  text-decoration: none;
+  color: #0366d6;
+}
+
+#toc a:hover {
+  text-decoration: underline;
+}

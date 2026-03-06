@@ -1,48 +1,327 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
 
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta property="og:title" content="Using MQTT for Device Communication">
-<meta property="og:description" content="Lessons and architecture considerations when integrating MQTT for backend systems.">
-<meta property="og:type" content="article">
-<meta property="og:url" content="https://ajitkatte.github.io/blog/mqtt.html">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta property="og:title" content="Using MQTT for Device Communication">
+    <meta property="og:description"
+        content="Lessons and architecture considerations when integrating MQTT for backend systems.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://ajitkatte.github.io/blog/mqtt.html">
 
-<title>Using MQTT for Device Communication | Ajit Katte</title>
-
-<link rel="stylesheet" href="../assets/style.css">
-<link rel="icon" href="../assets/favicon.ico">
+    <title>Using MQTT for Device Communication | Ajit Katte</title>
+    <link rel="stylesheet" href="../assets/style.css">
+    <link rel="icon" href="../assets/favicon.ico">
+    <link rel="stylesheet"
+href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
 </head>
 
 <body>
 
-<header>
+    <header>
 
-<a href="../index.html">← Home</a>
+        <a href="../index.html">← Home</a>
 
-<h1>Using MQTT for device communication</h1>
-
-<p><i>Article coming soon</i></p>
-
-</header>
-
-<hr>
-
-<p>
-I recently worked on integrating device communication using MQTT as the broker.
-This article will cover the architecture, lessons learned, and practical considerations when using MQTT for device communication and backend integration.
+        <h1>Using MQTT for device communication</h1>
+        <p class="post-meta">
+<span id="reading-time"></span> ·
+<span id="last-updated"></span>
 </p>
 
-<p>
-The full article will be published soon.
-</p>
+    </header>
 
-<footer>
+    <hr>
 
-© 2026 Ajit Katte
+    <article>
 
-</footer>
+        <h2>Contents</h2>
+        <ul id="toc"></ul>
+        <hr>
 
+        <h1 id="using-mqtt-and-emqx-for-reliable-desktop-application-communication">Using MQTT and EMQX for Reliable
+            Desktop application Communication</h1>
+        <p>In one of our systems we needed a reliable way for backend services to deliver events and commands to a
+            desktop application installed on user machines.</p>
+        <p>The desktop application consists of two components:</p>
+        <ul>
+            <li>A <strong>Windows Service</strong> responsible for background processing</li>
+            <li>A <strong>WPF application</strong> that provides the user interface</li>
+        </ul>
+        <p>Most of the system logic runs in the Windows Service, which needs to receive notifications and instructions
+            from the backend.</p>
+        <p>Initially we relied on <strong>Windows Push Notification Services (WNS)</strong>. However, several practical
+            limitations eventually led us to adopt <strong>MQTT with EMQX as the messaging layer</strong>.</p>
+        <p>This article describes the architecture we implemented, the problems we faced, and the lessons learned along
+            the way.</p>
+        <hr>
+        <h1 id="initial-approach-windows-push-notifications">Initial Approach: Windows Push Notifications</h1>
+        <p>Our original system used <strong>Windows Push Notification Services (WNS)</strong> to deliver messages to the
+            desktop application.</p>
+        <p>While WNS works well for certain application scenarios, it introduced several limitations for our
+            architecture.</p>
+        <h2 id="packaging-constraints">Packaging Constraints</h2>
+        <p>WNS requires applications to be packaged using <strong>MSIX</strong>.</p>
+        <p>Our desktop application was distributed using a traditional installer. Introducing MSIX created several
+            challenges:</p>
+        <ul>
+            <li>MSIX packaging significantly increased the <strong>size of the installation package</strong></li>
+            <li>Additional runtime dependencies had to be bundled</li>
+            <li>Deployment became more complicated in enterprise environments</li>
+            <li>Our existing installation and update mechanisms would have needed major changes</li>
+        </ul>
+        <p>Adopting MSIX purely to support WNS added unnecessary complexity.</p>
+        <h2 id="ui-dependency">UI Dependency</h2>
+        <p>Another limitation was that <strong>only the UI application can receive push notifications</strong>.</p>
+        <p>The Windows Service cannot directly receive WNS messages. This forced the system to depend on the UI layer
+            being active even though most of the processing happens in the background service.</p>
+        <h2 id="session-0-limitations">Session 0 Limitations</h2>
+        <p>The Windows Service runs in <strong>Session 0</strong>, while WNS notifications are delivered to the user
+            session.</p>
+        <p>This made it difficult to reliably route notifications to the background service.</p>
+        <h2 id="operational-issues">Operational Issues</h2>
+        <p>We also experienced several operational problems:</p>
+        <ul>
+            <li>Required Windows services were sometimes missing or disabled on user machines</li>
+            <li>Notification delivery was inconsistent and difficult to troubleshoot</li>
+            <li>Dependencies on Azure infrastructure that were outside our operational control</li>
+            <li>Limited visibility into delivery failures</li>
+        </ul>
+        <p>Because of these issues, the system became difficult to operate reliably at scale.</p>
+        <hr>
+        <h1 id="requirements-for-a-better-solution">Requirements for a Better Solution</h1>
+        <p>When redesigning the notification system, we needed a solution that:</p>
+        <ul>
+            <li>Works directly with the <strong>Windows Service</strong></li>
+            <li>Supports <strong>targeted device communication</strong></li>
+            <li>Provides <strong>reliable delivery</strong></li>
+            <li>Avoids backend state management</li>
+            <li>Integrates with existing authentication infrastructure</li>
+            <li>Scales easily with many connected devices</li>
+        </ul>
+        <p>After evaluating several approaches, we chose <strong>MQTT</strong>.</p>
+        <hr>
+        <h1 id="why-not-http-polling">Why Not HTTP Polling</h1>
+        <p>Polling from the desktop application was the simplest option but had several drawbacks:</p>
+        <ul>
+            <li>Constant network requests even when no events exist</li>
+            <li>Increased backend load</li>
+            <li>Higher latency between event generation and delivery</li>
+            <li>Backend storage required for pending messages</li>
+        </ul>
+        <p>As the number of devices grows, polling becomes inefficient.</p>
+        <hr>
+        <h1 id="why-not-websockets">Why Not WebSockets</h1>
+        <p>WebSockets provide real-time communication but using them through <strong>AWS API Gateway</strong> introduced
+            additional complexity:</p>
+        <ul>
+            <li>Managing large numbers of persistent connections</li>
+            <li>Handling reconnection logic</li>
+            <li>Backend infrastructure required to track connection IDs</li>
+            <li>Message routing logic required in backend services</li>
+        </ul>
+        <p>This added unnecessary operational overhead.</p>
+        <hr>
+        <h1 id="why-mqtt">Why MQTT</h1>
+        <p>MQTT is a lightweight messaging protocol designed for systems with large numbers of clients and intermittent
+            connectivity.</p>
+        <p>It provides several advantages:</p>
+        <ul>
+            <li>Lightweight protocol designed for persistent connections</li>
+            <li>Built-in <strong>publish–subscribe messaging model</strong></li>
+            <li>Topic-based routing handled by the broker</li>
+            <li>Reliable delivery using <strong>QoS levels</strong></li>
+            <li>Support for <strong>offline message buffering</strong></li>
+        </ul>
+        <p>Using MQTT allowed backend services to remain <strong>stateless</strong>, while delegating routing and
+            delivery responsibilities to the broker.</p>
+        <hr>
+        <h1 id="high-level-architecture">High-Level Architecture</h1>
+
+        <h2>Architecture Overview</h2>
+
+        <div class="mermaid">
+            flowchart TD
+
+            A[Backend Services] -->|Publish message| B[EMQX MQTT Broker]
+
+            B -->|MQTT Topic devices/deviceId| C[Desktop Application]
+
+            C --> D[Windows Service]
+            C --> E[WPF UI]
+
+            C -->|MQTT Connect with Access Token| B
+
+            B -->|HTTP Auth Request| F[API Gateway]
+
+            F --> G[Cognito]
+        </div>
+
+        <p>The system consists of:</p>
+        <ul>
+            <li>Desktop application (Windows Service + WPF UI)</li>
+            <li>MQTT Broker (EMQX)</li>
+            <li>Backend Services</li>
+            <li>Authentication through Cognito</li>
+            <li>API Gateway for authentication validation</li>
+        </ul>
+        <p>Each device subscribes to a deterministic topic pattern:</p>
+        <pre class="hljs"><code><div>devices/{deviceId}
+</div></code></pre>
+        <hr>
+        <h1 id="device-connection-flow">Device Connection Flow</h1>
+        <p>When the desktop application starts, the Windows Service connects to the MQTT broker.</p>
+        <p>The connection flow works as follows:</p>
+        <ol>
+            <li>The Windows Service attempts to connect to EMQX.</li>
+            <li>The client includes its <strong>existing access token</strong>.</li>
+            <li>EMQX receives the connection request.</li>
+            <li>EMQX performs <strong>HTTP authentication</strong> by calling an API Gateway endpoint.</li>
+            <li>The API Gateway validates the token using <strong>Cognito</strong>.</li>
+            <li>If authentication succeeds, EMQX accepts the connection.</li>
+            <li>The client subscribes to its device topic.</li>
+        </ol>
+        <p>Once subscribed, the desktop application can receive messages from the backend.</p>
+        <hr>
+        <h1 id="stateless-publisher-design">Stateless Publisher Design</h1>
+        <p>Backend services publish messages directly to the topic:</p>
+        <pre class="hljs"><code><div>devices/{deviceId}
+</div></code></pre>
+        <p>The publisher does <strong>not maintain any state about connected clients</strong>.</p>
+        <p>If the device is connected, the message is delivered immediately.<br>
+            If the device is offline, the broker stores the message until the device reconnects.</p>
+        <p>Advantages:</p>
+        <ul>
+            <li>No subscriber tracking in backend services</li>
+            <li>Simple publishing logic</li>
+            <li>Horizontal scalability</li>
+            <li>Loose coupling between services and clients</li>
+        </ul>
+        <hr>
+        <h1 id="message-delivery-model">Message Delivery Model</h1>
+        <p>The system uses:</p>
+        <ul>
+            <li><strong>QoS 1 (at-least-once delivery)</strong></li>
+            <li><strong>Message TTL of 60 days</strong></li>
+        </ul>
+        <p>QoS 1 ensures messages are delivered reliably.</p>
+        <p>If a device is temporarily offline, EMQX stores the message and delivers it when the client reconnects.</p>
+        <p>Because QoS 1 provides <em>at-least-once delivery</em>, duplicate messages are possible. The client processes
+            messages in an <strong>idempotent manner</strong>.</p>
+        <hr>
+        <h1 id="connection-resilience">Connection Resilience</h1>
+        <p>When large numbers of clients reconnect simultaneously (for example after a broker restart), connection
+            spikes can occur.</p>
+        <p>To prevent this, the desktop application uses <strong>exponential backoff with random jitter</strong>.</p>
+        <p>Example retry pattern:</p>
+        <pre class="hljs"><code><div>Retry 1 → 1s
+Retry 2 → 2s
+Retry 3 → 4s
+Retry 4 → 8s
+Retry 5 → 16s
+</div></code></pre>
+        <p>Random jitter spreads reconnection attempts across time and prevents a <strong>thundering herd
+                problem</strong>.</p>
+        <hr>
+        <h1 id="broker-deployment">Broker Deployment</h1>
+        <p>The MQTT broker runs using <strong>EMQX deployed in Kubernetes</strong>.</p>
+        <p>EMQX was chosen because:</p>
+        <ul>
+            <li>Multiple authentication options</li>
+            <li>Support for HTTP-based authentication</li>
+            <li>High performance for large numbers of connections</li>
+            <li>Easy deployment in containerized environments</li>
+        </ul>
+        <p>Since our backend already runs in Kubernetes, integrating EMQX was straightforward.</p>
+        <hr>
+        <h1 id="leveraging-a-pluggable-notification-architecture">Leveraging a Pluggable Notification Architecture</h1>
+        <p>Our platform already supported <strong>pluggable notification channels</strong>.</p>
+        <p>Previously, the system used Windows Push Notifications.</p>
+        <p>Because of this modular design, introducing MQTT required minimal changes. We implemented a new MQTT
+            notification provider and replaced the previous mechanism without breaking other parts of the system.</p>
+        <p>This demonstrated the value of designing systems with <strong>clear abstraction boundaries</strong>.</p>
+        <hr>
+        <h1 id="lessons-learned">Lessons Learned</h1>
+        <p>Some key takeaways from implementing this architecture:</p>
+        <ul>
+            <li>MQTT works extremely well for device communication scenarios</li>
+            <li>Topic naming should remain simple and deterministic</li>
+            <li>Broker-side authentication simplifies identity integration</li>
+            <li>Reconnection strategies are essential for stability</li>
+            <li>Designing systems with pluggable notification channels enables easier evolution</li>
+        </ul>
+        <hr>
+        <h1 id="final-thoughts">Final Thoughts</h1>
+        <p>Replacing Windows Push Notifications with MQTT significantly improved reliability and observability in our
+            system.</p>
+        <p>By delegating connection management, routing, and delivery guarantees to the MQTT broker, we simplified
+            backend services while improving system robustness.</p>
+        <p>EMQX combined with Kubernetes and HTTP-based authentication integrated cleanly with our existing
+            infrastructure and provided a scalable messaging layer for desktop applications.</p>
+
+
+    </article>
+    <footer>
+
+        © 2026 Ajit Katte
+
+    </footer>
+    <!-- Mermaid -->
+    <script src="https://unpkg.com/mermaid/dist/mermaid.min.js"></script>
+    <script>
+        mermaid.initialize({ startOnLoad: true });
+    </script>
+
+    <!-- TOC generator -->
+    <script>
+        document.addEventListener("DOMContentLoaded", function () {
+
+            const toc = document.getElementById("toc");
+            const headers = document.querySelectorAll("article h1, article h2");
+
+            headers.forEach(header => {
+
+                if (!header.id) return;
+
+                const li = document.createElement("li");
+                const a = document.createElement("a");
+
+                a.href = "#" + header.id;
+                a.textContent = header.textContent;
+
+                li.appendChild(a);
+                toc.appendChild(li);
+
+            });
+
+        });
+    </script>
+
+    <!-- Reading time -->
+    <script>
+        document.addEventListener("DOMContentLoaded", function () {
+
+            const article = document.querySelector("article");
+            const text = article.innerText;
+
+            const words = text.split(/\s+/).length;
+            const readingTime = Math.ceil(words / 200);
+
+            document.getElementById("reading-time").textContent =
+                readingTime + " min read";
+
+            const lastUpdated = new Date(document.lastModified);
+
+            document.getElementById("last-updated").textContent =
+                "Updated " + lastUpdated.toLocaleDateString();
+
+        });
+    </script>
+
+    <!-- Syntax highlighting -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>hljs.highlightAll();</script>
 </body>
+
 </html>
