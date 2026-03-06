@@ -210,14 +210,15 @@ To prevent this, the desktop agent uses **exponential backoff with random jitter
 Example retry pattern:
 
 ```
-Retry 1 → 1s
-Retry 2 → 2s
-Retry 3 → 4s
-Retry 4 → 8s
-Retry 5 → 16s
+Retry 1 → ~1s + jitter
+Retry 2 → ~2s + jitter
+Retry 3 → ~4s + jitter
+Retry 4 → ~8s + jitter
+Retry 5 → ~16s + jitter
 ```
 
-Random jitter spreads reconnection attempts across time and prevents a **thundering herd problem**.
+The jitter ensures that clients reconnect at slightly different times,
+preventing synchronized reconnect storms (**thundering herd problem**) when the broker becomes available again.
 
 ---
 

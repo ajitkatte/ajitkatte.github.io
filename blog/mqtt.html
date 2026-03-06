@@ -225,14 +225,15 @@
             spikes can occur.</p>
         <p>To prevent this, the desktop application uses <strong>exponential backoff with random jitter</strong>.</p>
         <p>Example retry pattern:</p>
-        <pre class="hljs"><code><div>Retry 1 → 1s
-Retry 2 → 2s
-Retry 3 → 4s
-Retry 4 → 8s
-Retry 5 → 16s
+        <pre class="hljs"><code><div>Retry 1 → ~1s + jitter
+Retry 2 → ~2s + jitter
+Retry 3 → ~4s + jitter
+Retry 4 → ~8s + jitter
+Retry 5 → ~16s + jitter
 </div></code></pre>
-        <p>Random jitter spreads reconnection attempts across time and prevents a <strong>thundering herd
-                problem</strong>.</p>
+        <p>The jitter ensures that clients reconnect at slightly different times,
+            preventing synchronized reconnect storms (<strong>thundering herd problem</strong>) when the broker becomes
+            available again.</p>
         <hr>
         <h1 id="broker-deployment">Broker Deployment</h1>
         <p>The MQTT broker runs using <strong>EMQX deployed in Kubernetes</strong>.</p>
