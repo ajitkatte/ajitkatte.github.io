@@ -4,7 +4,7 @@ This repository contains the source code for my personal website and engineering
 
 The site is hosted using **GitHub Pages** and is available at:
 
-https://ajitkatte.in
+https://ajitkatte.github.io
 
 ## About
 
