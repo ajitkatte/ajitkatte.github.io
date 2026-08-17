@@ -1,0 +1,342 @@
+# Unattended Windows IKEv2/IPsec VPN Connections with PowerShell, Named Pipes, and RAS P/Invoke
+
+In one of our desktop-agent deployments, devices needed to connect to a VPN gateway provisioned in Azure. The connection had to be initiated from the application, use credentials provisioned per device, and never ask the interactive user to enter a user name or password.
+
+The desktop agent consists of two parts:
+
+- A WPF application in the interactive user session
+- A Windows Service that runs in Session 0
+
+The service owns the sensitive work. It receives a connection request from the UI through a named pipe, obtains the current VPN configuration and encrypted device credentials from the backend, creates a temporary Windows VPN profile, and dials it through the native RAS API. After disconnecting, it removes that profile.
+
+This post explains the design and why we used PowerShell for profile management but C# P/Invoke for the actual connection.
+
+---
+
+# The Requirements
+
+We needed a VPN workflow that:
+
+- Works from a desktop application without exposing secrets to the UI
+- Connects without showing a Windows credential prompt
+- Uses device-specific credentials that can be rotated by the backend
+- Does not persist credentials in the Windows phonebook or Credential Manager
+- Supports an IKEv2/IPsec gateway hosted in Azure
+- Provides clear connection status and diagnostics to the UI
+
+Calling a command-line tool with a password was not acceptable. Command-line arguments can be exposed through diagnostics, process inspection, or logs. Storing a password in a phonebook entry would also work against credential rotation.
+
+---
+
+# RAS, VPN Phonebooks, and Windows
+
+Remote Access Service (RAS) is the Windows subsystem for remote-access connections, including VPN connections. A Windows VPN profile is represented as a phonebook entry. Windows owns the protocol negotiation, routing, authentication integration, and connection lifecycle; an application can manage that functionality through documented APIs.
+
+The RAS client API includes functions to create and manage connections, dial a profile, query its state, and disconnect it. Our application used the client-side API exposed by `rasapi32.dll`:
+
+- `RasDial` to connect
+- `RasGetConnectStatus` to inspect the connection state
+- `RasHangUp` to terminate an in-process connection when required
+
+Our supported application baseline was Windows 8.1 and Windows Server 2012 R2. The RAS APIs themselves are long-standing Windows APIs and remain documented by Microsoft for Windows desktop applications. This does not make any integration permanently future-proof, but it made RAS a stable, supported platform boundary rather than a private Windows implementation detail.
+
+---
+
+# Why PowerShell Was Not the Connection Mechanism
+
+The Windows `VpnClient` PowerShell module is useful for managing a profile. It can create, inspect, change, and remove a VPN connection. However, the profile is only the configuration; it is not a safe place to keep our rotating device credentials.
+
+We used PowerShell to ensure the IKEv2 profile existed and matched the expected endpoint and IPsec settings. We used C# P/Invoke and `RasDial` to connect to that phonebook entry with credentials supplied only for that dial attempt.
+
+`rasdial.exe` was used only to disconnect an existing connection:
+
+```powershell
+rasdial "Contoso Device VPN" /disconnect
+```
+
+The connect path did not use `rasdial.exe`, so no password appeared in a process command line.
+
+---
+
+# Why We Did Not Use a Third-Party VPN Client
+
+We also evaluated OpenVPN and other third-party VPN clients. They can be good choices when their protocol and deployment model fit the environment, but they added operational work that did not exist with the native Windows stack.
+
+For example, an OpenVPN-based approach required distributing a CLI client alongside the desktop agent, supplying its configuration and supporting files, and ensuring that the correct client version was installed on every machine. The product would then own compatibility testing, upgrades, rollback, and support for that additional VPN runtime.
+
+That was a significant engineering cost for a workflow that Windows could already support through its built-in IKEv2/IPsec and RAS capabilities. Using the native client reduced the installation footprint and kept profile management and connection lifecycle inside the operating system.
+
+---
+
+# High-Level Architecture
+
+```mermaid
+sequenceDiagram
+    participant UI as WPF UI
+    participant Service as Windows Service (Session 0)
+    participant Backend as Backend
+    participant Windows as Windows VPN Phonebook / RAS
+    participant Gateway as Azure VPN Gateway
+
+    UI->>Service: Named pipe: Connect
+    Service->>Backend: Fetch VPN endpoint and encrypted device credentials
+    Backend-->>Service: VPN configuration and encrypted credentials
+    Service->>Service: Decrypt credentials in memory
+    Service->>Windows: PowerShell: create temporary IKEv2 profile
+    Service->>Windows: C# P/Invoke: RasDial with temporary credentials
+    Windows->>Gateway: Establish IKEv2/IPsec tunnel
+    Gateway-->>Windows: Tunnel established
+    Windows-->>Service: RAS connection success
+    Service-->>UI: Named pipe: Connected
+```
+
+The named pipe was a security boundary, not simply a convenient transport. The UI exposed only two actions—`Connect` and `Disconnect`. The service accepted only authorized local callers and did not accept a profile name, server address, password, or arbitrary PowerShell command from the UI.
+
+---
+
+# Provisioning a Temporary IKEv2 Profile
+
+The service created the profile for every connection request and removed it after disconnecting. This ensured that endpoint configuration was retrieved fresh from the backend for each connection and that no VPN profile remained on the device when it was not in use.
+
+For a machine-wide profile, the process requires the appropriate elevation and uses `-AllUserConnection`. The profile name was fixed and service-controlled, so a stale entry from an interrupted earlier attempt could be removed safely before creating the next profile. The service also serialized connect and disconnect operations, preventing concurrent requests from modifying the same temporary profile.
+
+The exact authentication and IPsec transforms must match the gateway policy. The example intentionally uses placeholder addresses and representative transforms; do not copy cryptographic settings without validating them with the gateway administrator.
+
+```powershell
+$profileName = "Contoso Device VPN"
+$serverAddress = "vpn.example.invalid"
+
+$existing = Get-VpnConnection -Name $profileName -AllUserConnection -ErrorAction SilentlyContinue
+if ($existing -and $existing.ConnectionStatus -ne "Disconnected") {
+    throw "VPN profile has an active connection operation."
+}
+
+if ($existing) {
+    Remove-VpnConnection -Name $profileName -AllUserConnection -Force
+}
+
+Add-VpnConnection `
+    -Name $profileName `
+    -ServerAddress $serverAddress `
+    -TunnelType Ikev2 `
+    -EncryptionLevel Required `
+    -SplitTunneling $true `
+    -AllUserConnection `
+    -Force
+
+Set-VpnConnectionIPsecConfiguration `
+    -ConnectionName $profileName `
+    -AuthenticationTransformConstants None `
+    -CipherTransformConstants AES256 `
+    -EncryptionMethod AES256 `
+    -IntegrityCheckMethod SHA256 `
+    -PfsGroup None `
+    -DHGroup ECP256 `
+    -AllUserConnection `
+    -Force
+```
+
+The service treated the profile as disposable. It handled an interrupted earlier attempt by removing its own known stale entry before creating the fresh profile, but first rejected a request when the profile had an active connection operation. It did not delete arbitrary user-created VPN entries.
+
+---
+
+# Connecting with RasDial from C#
+
+`RasDial` accepts a `RASDIALPARAMS` structure that identifies the phonebook entry and provides the credentials for the current connection. This is the important difference from a profile whose credentials are saved for later use.
+
+The following is an abridged example. The production interop layer should define every native structure and fixed buffer size against the Windows SDK for the target architecture.
+
+```csharp
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 4)]
+internal struct RasDialParams
+{
+    public uint DwSize;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 257)]
+    public string EntryName;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 129)]
+    public string PhoneNumber;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 129)]
+    public string CallbackNumber;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 257)]
+    public string UserName;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 257)]
+    public string Password;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)]
+    public string Domain;
+
+    public uint SubEntry;
+    public IntPtr CallbackId;
+    public uint InterfaceIndex;
+}
+
+[DllImport("rasapi32.dll", EntryPoint = "RasDialW", ExactSpelling = true,
+    CallingConvention = CallingConvention.Winapi)]
+internal static extern uint RasDial(
+    IntPtr extensions,
+    string? phonebookPath,
+    ref RasDialParams parameters,
+    uint notifierType,
+    IntPtr notifier,
+    out IntPtr connectionHandle);
+
+[DllImport("rasapi32.dll", CallingConvention = CallingConvention.Winapi)]
+internal static extern uint RasHangUp(IntPtr connectionHandle);
+```
+
+The service populated the parameters just before dialing:
+
+```csharp
+var parameters = new RasDialParams
+{
+    DwSize = (uint)Marshal.SizeOf<RasDialParams>(),
+    EntryName = profileName,
+    UserName = vpnCredential.UserName,
+    Password = vpnCredential.Password,
+    Domain = vpnCredential.Domain ?? string.Empty
+};
+
+uint result = RasDial(
+    IntPtr.Zero,
+    phonebookPath: null,
+    ref parameters,
+    notifierType: 0,
+    notifier: IntPtr.Zero,
+    out IntPtr connectionHandle);
+
+if (result != 0)
+{
+    if (connectionHandle != IntPtr.Zero)
+    {
+        RasHangUp(connectionHandle);
+    }
+
+    throw new Win32Exception((int)result, "Unable to start VPN connection.");
+}
+```
+
+This example passes no notifier, so `RasDial` operates synchronously: a zero result means the connection attempt completed successfully. An asynchronous implementation can supply a RAS notification callback and use `RasGetConnectStatus` to report progress.
+
+---
+
+# A Testable VPN Service Boundary
+
+The Windows APIs were deliberately kept behind a small service boundary. This avoided coupling the named-pipe handler, backend client, PowerShell profile code, and native RAS interop into one large class.
+
+```csharp
+public interface IVpnManager
+{
+    Task<VpnConnectionResult> ConnectAsync(
+        VpnConnectionRequest request,
+        CancellationToken cancellationToken);
+
+    Task<VpnStatus> GetStatusAsync(string profileName);
+
+    Task DisconnectAsync(string profileName);
+}
+```
+
+`IVpnManager` is implemented by the RAS interop layer. It receives a profile name and the short-lived credential material required for the current dial attempt; it does not know how the service received a UI request or fetched the credentials.
+
+The service-level facade coordinates the full workflow:
+
+```csharp
+public async Task<VpnConnectionResult> ConnectAsync(
+    CancellationToken cancellationToken)
+{
+    var configuration = await configurationClient
+        .GetCurrentDeviceVpnConfigurationAsync(cancellationToken);
+
+    await profileManager.CreateTemporaryProfileAsync(
+        configuration.Profile,
+        cancellationToken);
+
+    try
+    {
+        return await vpnManager.ConnectAsync(
+            new VpnConnectionRequest(
+                configuration.Profile.Name,
+                configuration.Credential),
+            cancellationToken);
+    }
+    catch
+    {
+        await profileManager.RemoveTemporaryProfileAsync(
+            configuration.Profile.Name,
+            cancellationToken);
+        throw;
+    }
+}
+```
+
+This keeps responsibilities clear:
+
+- `VpnFacade` authorizes the request and orchestrates the workflow
+- `WindowsVpnProfileManager` uses PowerShell to create and remove the temporary phonebook profile
+- `RasVpnManager` implements `IVpnManager` using the RAS APIs
+- The UI can request only `Connect` or `Disconnect`; it cannot influence the connection configuration
+
+It also makes the design easier to test. Profile reconciliation, backend configuration retrieval, and RAS dialing can be mocked independently, while the P/Invoke code stays in a narrow, integration-tested adapter.
+
+---
+
+# Credential Lifecycle
+
+The backend provisioned credentials per device and rotated them. The service received and decrypted the current credential only when a connection was requested.
+
+The credentials were never persisted locally in the phonebook or Windows Credential Manager. They existed transiently in service memory for the dial attempt, which is more precise than saying they were never present on the device at all.
+
+Important implementation rules were:
+
+- Never send credentials across the named pipe
+- Never put credentials in a PowerShell command line or `rasdial.exe` arguments
+- Never log the username, password, decrypted payload, or full credential object
+- Clear or release sensitive buffers where the implementation permits it
+- Ensure backend rotation is reflected before a retry after authentication failures
+
+---
+
+# Disconnecting and Reporting State
+
+For the disconnect workflow, the service invoked `rasdial.exe` with the profile name and `/disconnect`, then removed the temporary profile. No credential-bearing data was required for either command.
+
+```powershell
+rasdial "Contoso Device VPN" /disconnect
+Remove-VpnConnection -Name "Contoso Device VPN" -AllUserConnection -Force
+```
+
+The service retained detailed RAS error codes in protected service logs for troubleshooting. The UI's role remained intentionally narrow: it could request a connection or disconnection, but it could not choose how the VPN connected.
+
+This separation kept the UI responsive while preserving a clear ownership model: the UI requested an action, but the Session 0 service owned the VPN profile, the temporary credential material, and the RAS connection lifecycle.
+
+---
+
+# Security Considerations
+
+This design reduced exposure, but it still required careful engineering:
+
+- Restrict the named-pipe ACL and validate the caller identity
+- Make profile names fixed or backend-controlled; do not let the UI provide arbitrary phonebook paths
+- Require TLS and device authentication when retrieving credential material
+- Use least privilege for the service account while meeting the requirements for machine-wide profile management
+- Redact connection diagnostics and avoid storing secrets in crash dumps where possible
+- Treat gateway certificate validation, IPsec transforms, routes, and DNS as part of the security policy
+
+The service is privileged and handles the most sensitive data in the flow. Its named-pipe interface should therefore be reviewed like a local security API.
+
+---
+
+# Lessons Learned
+
+- A VPN profile and a VPN connection are separate concerns; PowerShell created and removed the temporary profile, while RAS interop handled the connection.
+- Session 0 was the appropriate location for device-scoped credentials and connectivity operations.
+- Passing credentials directly to `RasDial` avoided interactive prompts without persisting them locally.
+- Backend-driven credential rotation made retry and error handling part of the connection design.
+- A small, authenticated named-pipe contract kept the UI unprivileged and the sensitive implementation contained.
+
+Using Windows' built-in RAS stack allowed us to combine native IKEv2/IPsec support with a controlled desktop-agent workflow. The result was an unattended connection path that remained observable, did not store device credentials locally, and fit naturally into the service architecture.
